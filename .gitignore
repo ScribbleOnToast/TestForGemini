@@ -1,0 +1,15 @@
+﻿################################################################################
+# This .gitignore file was automatically created by Microsoft(R) Visual Studio.
+################################################################################
+
+/.vs
+/.vscode
+/DigitalEye/bin
+/DigitalEye/obj
+/dist
+/DigitalEye/model/vlm
+/DigitalEye/model/llm
+/model_assets
+/DigitalEye/pyscripts/__pycache__
+/DigitalEye/logs
+/DigitalEye/pyscripts/hailort.log

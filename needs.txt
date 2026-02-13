@@ -1,0 +1,41 @@
+Update System:
+sudo apt update && sudo apt upgrade full-upgrade -y
+sudo rpi-eeprom-update -a
+sudo raspi-config -> Advanced -Pcie -> 3x
+reboot
+
+Add Hailo10h drivers:
+sudo apt install dkms
+sudo apt install hailo-h10-all
+reboot
+hailortcli fw-control identify
+
+Add camera dependencies:
+sudo apt update && sudo apt install rpicam-apps 
+rpicam-hello
+
+dotnet 10 runtimes
+curl -sSL https://dot.net/v1/dotnet-install.sh | bash /dev/stdin --channel 10.0
+echo 'export DOTNET_ROOT=$HOME/.dotnet' >> ~/.bashrc
+echo 'export PATH=$PATH:$HOME/.dotnet' >> ~/.bashrc
+source ~/.bashrc
+
+Moonshine for sherpa - Speech Recognition
+https://huggingface.co/csukuangfj/sherpa-onnx-moonshine-tiny-en-int8/resolve/main/preprocess.onnx
+https://huggingface.co/csukuangfj/sherpa-onnx-moonshine-tiny-en-int8/resolve/main/encode.int8.onnx
+https://huggingface.co/csukuangfj/sherpa-onnx-moonshine-tiny-en-int8/resolve/main/uncached_decode.int8.onnx
+https://huggingface.co/csukuangfj/sherpa-onnx-moonshine-tiny-en-int8/resolve/main/cached_decode.int8.onnx
+https://huggingface.co/csukuangfj/sherpa-onnx-moonshine-tiny-en-int8/resolve/main/tokens.txt
+
+TTS voices for Sherpa
+wget https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-amy-low.tar.bz2
+
+Pipewire and shit
+sudo apt install pipewire pipewire-pulse pipewire-alsa pulseaudio-utils wireplumber libspa-0.2-bluetooth
+pactl info
+
+sudo apt install libportaudio2
+dotnet publish -r linux-arm64 -c Release --self-contained false \
+    -p:PublishSingleFile=true \
+    -p:PublishReadyToRun=true \
+    -o ./dist/publish

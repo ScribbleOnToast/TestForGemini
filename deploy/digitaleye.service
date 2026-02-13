@@ -1,0 +1,16 @@
+[Unit]
+Description=Digital Eye User Session Service
+After=pipewire.service wireplumber.service bluetooth.service
+
+[Service]
+Environment=DOTNET_ROOT=/usr/share/dotnet
+Environment=LD_LIBRARY_PATH=/opt/digitaleye/lib
+Environment=PATH=/usr/share/dotnet:/opt/digitaleye:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=/opt/digitaleye
+ExecStart=/opt/digitaleye/DigitalEye
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
