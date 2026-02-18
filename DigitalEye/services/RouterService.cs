@@ -9,6 +9,8 @@ public class RouterService : IDisposable
 {
     private readonly ILogger<RouterService> _logger;
     public Speaker _speaker;
+    private Socket? _llmSocket;
+    private const string LLMSocketPath = "/tmp/digitaleye_brain.sock";
 
     public RouterService(string modelPath, ILogger<RouterService> logger, Speaker speaker)
     {
@@ -16,12 +18,13 @@ public class RouterService : IDisposable
         _speaker = speaker;
     }
 
-    public async Task WarmUpAsync()
+    public async Task<bool> WarmUpAsync()
     {
         _logger.LogInformation("Warming up local LLM...");
         // Run a dummy inference to load weights into memory
         await RouteCommandAsync("Hello", 10); 
         _logger.LogInformation("Warm-up complete.");
+        return true;
     }
 
     public async Task<RouteCommandResult> RouteCommandAsync(string transcript, int timeout = 5)
@@ -33,23 +36,27 @@ public class RouterService : IDisposable
     {
         try
         {
-            var socketPath = "/tmp/digital_eye_brain.sock";
-            using var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
-            await socket.ConnectAsync(new UnixDomainSocketEndPoint(socketPath));
+            _llmSocket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+            var endpoint = new UnixDomainSocketEndPoint(LLMSocketPath);
+            await _llmSocket.ConnectAsync(endpoint);
+            _logger.LogInformation(_llmSocket.Connected ? "Connected to Brain Engine" : "Failed to connect to Brain Engine");
 
             // Send the transcription from Sherpa
-            byte[] data = Encoding.UTF8.GetBytes(transcript);
-            await socket.SendAsync(data, SocketFlags.None);
+            var serialized = JsonSerializer.Serialize(transcript) + "\n";
+            byte[] data = Encoding.UTF8.GetBytes(serialized);
+            await _llmSocket.SendAsync(new ArraySegment<byte>(data), SocketFlags.None);
 
             // Receive the JSON result
             byte[] buffer = new byte[1024];
-            int received = await socket.ReceiveAsync(buffer, SocketFlags.None);
+            int received = await _llmSocket.ReceiveAsync(buffer, SocketFlags.None);
             var response = JsonSerializer.Deserialize<LLMResponse>(Encoding.UTF8.GetString(buffer, 0, received));
             var intent = response?.Intent.ToLowerInvariant();
             return intent switch
             {
                 "system" => new RouteCommandResult(CommandIntent.System, ParseSystemPayload(response.Payload)),
                 "override" => new RouteCommandResult(CommandIntent.Override, ParseOverridePayload(response.Payload)),
+                "indentify" => new RouteCommandResult(CommandIntent.Identify, new IdentifyPayload(transcript)),
+                "error" => new RouteCommandResult(CommandIntent.Error, new ErrorPayload(response.Payload)),
                 _ => new RouteCommandResult(CommandIntent.Error, new ErrorPayload($"Unknown Intent: {response?.Intent}"))
             };                        
         }

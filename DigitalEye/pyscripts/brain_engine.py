@@ -1,5 +1,16 @@
 ﻿import socket
 import os
+import socket
+import json
+import os
+import cv2
+import numpy as np
+import time
+import signal
+import sys
+import queue
+import multiprocessing as mp
+import re 
 import json
 import ollama
 
@@ -14,7 +25,7 @@ SYSTEM_PROMPT = (
             "SYSTEM: User wants to change or hear system settings (e.g. \"volume up\", \"shutdown\", \"battery\")."
             "OVERRIDE: User wants to control media playback flow (e.g. \"stop\", \"pause\", \"skip\")."      
             "ERROR: If the input is not understood or cannot be mapped to a valid intent."
-            "Valid Payloads:"
+            "Valid Payload examples:"
             "For SYSTEM: \"volume_up\", \"volume_down\", \"volume_set <number>\", \"mute\", \"unmute\", \"shutdown\"."
             "For IDENTIFY: Respond with the input payload. This will be passed to another recognizer."
             "For OVERRIDE: \"stop\", \"pause\", \"skip\", \"play\"."
@@ -26,7 +37,6 @@ SYSTEM_PROMPT = (
             "Example Input: \"Read this sign\""
             "Example JSON: { \"intent\": \"IDENTIFY\", \"payload\": \"Read this sign\" }"
 )
-
 
 def handle_intent(text):
     try:
@@ -43,24 +53,28 @@ def handle_intent(text):
         return json.dumps({"error": str(e)})
 
 def start_server():
+    print("Starting LLM Interface...")
     # Clean up the socket if it already exists
     if os.path.exists(SOCKET_PATH):
         os.remove(SOCKET_PATH)
 
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(SOCKET_PATH)
-    server.listen(1024)
+    server.listen(1)
     print(f"Brain Engine listening on {SOCKET_PATH}...")
+    conn, _ = server.accept()
     while True:
         conn, _ = server.accept()
+        print("Client connected to Brain Engine")
         try:
             data = conn.recv(1024)
-            if data:
-                user_text = data.decode('utf-8')
-                result = handle_intent(user_text)
-                conn.sendall(result.encode('utf-8'))
-        finally:
-            conn.close()
-
+            if not data: continue  
+            print(f"Received command: {data.decode('utf-8')}")
+            user_text = data.decode('utf-8')
+            result = handle_intent(user_text)
+            conn.sendall(result.encode('utf-8'))
+        except Exception as e:
+            print(f"Error handling command: {e}")
+    print("Shutting down Brain Engine...")
 if __name__ == "__main__":
     start_server()

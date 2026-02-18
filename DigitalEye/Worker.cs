@@ -26,7 +26,7 @@ public class Worker(ILogger<Worker> logger,
 #region Worker Properties and Fields
     //VLM backend process and socket (I talk to the camera)
     private Process? _vlmProcess;
-    private Socket? _vlmScket;
+    private Socket? _vlmSocket;
     private const string VLMSocketPath = "/tmp/digitaleye_vision.sock";
     private const string VLMPythonScript = "vision_interface.py";
     private bool _vlmReady = false;
@@ -88,8 +88,8 @@ public class Worker(ILogger<Worker> logger,
     public override Task StopAsync(CancellationToken cancellationToken)
     {
         _logger.LogInformation("Cleaning up worker resources.");
-        _vlmScket?.Close();
         _llmSocket?.Close();
+        _vlmSocket?.Close();
         _vlmProcess?.Kill(entireProcessTree: true);
         _llmProcess?.Kill(entireProcessTree: true);
         _recognizer?.Dispose();
@@ -106,7 +106,10 @@ public class Worker(ILogger<Worker> logger,
         File.Delete(VLMSocketPath); // Clean up old socket if exists
 
         // Start the venv python directly (avoids an extra shell and makes shutdown predictable)
-        var venvPath = Path.Combine(AppContext.BaseDirectory, "venv");
+        //var venvPath = Path.Combine(AppContext.BaseDirectory, "venv");
+        //dev
+        var venvPath = "/opt/digitaleye/venv";       
+        
         var pythonExe = System.IO.Path.Combine(venvPath, "bin", "python");
         var start = new ProcessStartInfo
         {
@@ -118,16 +121,9 @@ public class Worker(ILogger<Worker> logger,
             CreateNoWindow = true,
             WorkingDirectory = "./pyscripts"
         };
-
-        // Ensure the venv bin is at the front of PATH so the venv environment is used
-        try
-        {
-            var existingPath = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
-            start.Environment["VIRTUAL_ENV"] = venvPath;
-            start.Environment["PATH"] = System.IO.Path.Combine(venvPath, "bin") + ":" + existingPath;
-        }
-        catch { }
-
+        var existingPath = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
+        start.Environment["VIRTUAL_ENV"] = venvPath;
+        start.Environment["PATH"] = System.IO.Path.Combine(venvPath, "bin") + ":" + existingPath;
         _vlmProcess = new Process { StartInfo = start };
 
         // Pipe Python logs to C# Logger
@@ -150,14 +146,14 @@ public class Worker(ILogger<Worker> logger,
             }
         };
 
+        
+        //Start the python process for the vision identification system
         _vlmProcess.Start();
         _vlmProcess.BeginOutputReadLine();
         _vlmProcess.BeginErrorReadLine();
-
         _logger.LogDebug($"DigitalEye Brain started (PID: {_vlmProcess.Id})");
-        #endregion
 
-        #region Wait for VLM ready
+        //Wait for python script to create the socket file before trying to connect
         while (!File.Exists(VLMSocketPath) && !ct.IsCancellationRequested)
         {
             _logger.LogDebug("Brain Socket not found yet, waiting...");
@@ -165,7 +161,7 @@ public class Worker(ILogger<Worker> logger,
         }
 
         _logger.LogDebug("Connecting to unix socket socket...{SocketPath}", VLMSocketPath);
-        _vlmScket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+        _vlmSocket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
         var endpoint = new UnixDomainSocketEndPoint(VLMSocketPath);
 
         int attempts = 0;
@@ -173,7 +169,7 @@ public class Worker(ILogger<Worker> logger,
         {
             try
             {
-                await _vlmScket.ConnectAsync(endpoint, ct);
+                await _vlmSocket.ConnectAsync(endpoint, ct);
                 _logger.LogDebug("Connected to unix socket!");
                 break;
             }
@@ -185,13 +181,14 @@ public class Worker(ILogger<Worker> logger,
             }
         }
 
+        //Wait for ready signal from python interface before accepting commands
         while (!ct.IsCancellationRequested && !_vlmReady)
         {
             _logger.LogDebug("Waiting for Brain to signal ready...");
-            if (_vlmScket != null && _vlmScket.Connected)
+            if (_vlmSocket != null && _vlmSocket.Connected)
             {
                 var buffer = new byte[4096];
-                var bytesRead = await _vlmScket.ReceiveAsync(buffer, SocketFlags.None);
+                var bytesRead = await _vlmSocket.ReceiveAsync(buffer, SocketFlags.None);
                 var jsonRes = Encoding.UTF8.GetString(buffer, 0, bytesRead);
 
                 // C. Parse
@@ -204,7 +201,7 @@ public class Worker(ILogger<Worker> logger,
             }
             await Task.Delay(3000, ct);
         }
-        #endregion
+        await Announce("Camera System is ready.", playNow: true);
     }
 
     private async Task StartLLMEngine(CancellationToken ct)
@@ -212,7 +209,9 @@ public class Worker(ILogger<Worker> logger,
         await Announce("Starting Language Engine...", false);
         File.Delete(LLMSocketPath); // Clean up old socket if exists
 
-        var pythonExe = "python";
+        var venvPath = "/opt/digitaleye/venv";       
+        
+        var pythonExe = Path.Combine(venvPath, "bin", "python");
         var start = new ProcessStartInfo
         {
             FileName = pythonExe,
@@ -249,7 +248,7 @@ public class Worker(ILogger<Worker> logger,
         _llmProcess.Start();
         _llmProcess.BeginOutputReadLine();
         _llmProcess.BeginErrorReadLine();
-        _logger.LogDebug($"LLM Interface started (PID: {_vlmProcess.Id})");
+        _logger.LogDebug($"LLM Interface started (PID: {_llmProcess.Id})");
 
         while (!File.Exists(LLMSocketPath) && !ct.IsCancellationRequested)
         {
@@ -258,7 +257,7 @@ public class Worker(ILogger<Worker> logger,
         }
 
         _logger.LogDebug("Connecting to unix socket socket...{SocketPath}", LLMSocketPath);
-        _vlmScket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+        _llmSocket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
         var endpoint = new UnixDomainSocketEndPoint(LLMSocketPath);
 
         int attempts = 0;
@@ -266,7 +265,7 @@ public class Worker(ILogger<Worker> logger,
         {
             try
             {
-                await _vlmScket.ConnectAsync(endpoint, ct);
+                await _llmSocket.ConnectAsync(endpoint, ct);
                 _logger.LogDebug("Connected to unix socket!");
                 break;
             }
@@ -277,27 +276,8 @@ public class Worker(ILogger<Worker> logger,
                 await Task.Delay(1000, ct);
             }
         }
-
-        while (!ct.IsCancellationRequested && !_vlmReady)
-        {
-            _logger.LogDebug("Waiting for LLM to signal ready...");
-            if (_vlmScket != null && _vlmScket.Connected)
-            {
-                var buffer = new byte[4096];
-                var bytesRead = await _vlmScket.ReceiveAsync(buffer, SocketFlags.None);
-                var jsonRes = Encoding.UTF8.GetString(buffer, 0, bytesRead);
-
-                // C. Parse
-                var doc = JsonSerializer.Deserialize<VisionResponse>(jsonRes);
-                if (doc!.Type == "ready")
-                {
-                    _logger.LogDebug("LLM interface is ready!");
-                    _vlmReady = true;
-                }
-            }
-            await Task.Delay(3000, ct);
-        }
         await _routerService.WarmUpAsync();
+        await Announce("LLM Interface is ready.", playNow: true);
         _llmReady = true;
     }
     
@@ -330,17 +310,49 @@ public class Worker(ILogger<Worker> logger,
         }
         finally
         {
+            _ = Announce("Camera System stopped.");
             _vlmProcess = null;
-            _llmSocket?.Close();
-            _llmSocket = null;
+            _vlmSocket?.Close();    
+            _vlmSocket = null;  
         }
     }
 
     public async Task StopLLMEngine(CancellationToken ct)
     {
-
+        try
+        {
+            _ = Announce("Stopping Language System.");
+            if (_llmProcess != null && !_llmProcess.HasExited)
+            {
+                try
+                {
+                    _llmProcess.Close();
+                    if (!_llmProcess.WaitForExit(5000))
+                    {
+                        _logger.LogWarning("Python Brain did not exit gracefully. Attempting to kill...");
+                        _llmProcess.Kill(entireProcessTree: true);
+                    }
+                }
+                catch (Exception ex)            {
+                    _logger.LogError(ex, "Error while stopping Python Brain: {Message}", ex.Message);
+                    try { _llmProcess.Kill(); } catch { }
+                }
+            }
+            await Announce("Digital Eye Engine stopped.");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Unexpected error while stopping Python Brain: {Message}", ex.Message);
+        }
+        finally
+        {
+            _ = Announce("Camera System stopped.");
+            _llmProcess = null;
+            _llmSocket?.Close();    
+            _llmSocket = null;  
+        }
     }
-
+#endregion
 #region Core Logic (The Brain)
     private async Task HandleVoiceCommandAsync(RouteCommandResult cmd, CancellationToken cancellationToken)
     {
@@ -404,7 +416,7 @@ public class Worker(ILogger<Worker> logger,
         try
         {
             _logger.LogDebug("Getting VLM response: {Prompt}", prompt);
-            if (_vlmScket == null || !_vlmScket.Connected)
+            if (_vlmSocket == null || !_vlmSocket.Connected)
             {
                 _logger.LogError("Error: VLM Offline");
                 await Announce("Error: VLM Offline");
@@ -412,7 +424,7 @@ public class Worker(ILogger<Worker> logger,
             }
             var jsonReq = JsonSerializer.Serialize(prompt) + "\n"; // newline-delimited
             var reqBytes = Encoding.UTF8.GetBytes(jsonReq);
-            int bytesSent = await _vlmScket.SendAsync(new ArraySegment<byte>(reqBytes), SocketFlags.None);
+            int bytesSent = await _vlmSocket.SendAsync(new ArraySegment<byte>(reqBytes), SocketFlags.None);
         }
         catch (Exception ex)
         {
@@ -584,7 +596,7 @@ public class Worker(ILogger<Worker> logger,
     {
         try
         {
-            if (_vlmScket == null) return;
+            if (_llmSocket == null) return;
             var messageBuffer = new StringBuilder();
             var buffer = new byte[4096];
 
@@ -593,7 +605,7 @@ public class Worker(ILogger<Worker> logger,
                 int bytesRead;
                 try
                 {
-                    bytesRead = await _vlmScket.ReceiveAsync(new ArraySegment<byte>(buffer), SocketFlags.None);
+                    bytesRead = await _llmSocket.ReceiveAsync(new ArraySegment<byte>(buffer), SocketFlags.None);
                 }
                 catch
                 {

@@ -27,7 +27,7 @@ if %ERRORLEVEL% neq 0 (
 
 echo Building and Publishing...
 del ".\dist\publish"
-dotnet publish ".\DigitalEye.slnx" -r linux-arm64 -c Release --self-contained false -p:PublishSingleFile=true -p:PublishReadyToRun=true -o ".\dist\publish"
+dotnet publish ".\DigitalEye.slnx" -r linux-arm64 -c Release p:self-contained=true -p:PublishSingleFile=true -p:PublishReadyToRun=true -o ".\dist\publish"
 if %ERRORLEVEL% neq 0 (
     echo Error: dotnet publish failed.
     exit /b 1
@@ -48,6 +48,7 @@ echo Copying installer scripts and configs...
 copy "deploy\*.sh" "%USB_PATH%\" /Y
 copy "deploy\requirements.txt" "%USB_PATH%\configs\" /Y
 copy "deploy\digitaleye.service" "%USB_PATH%\configs\systemd\" /Y
+copy "model_assets\ollama-linux-arm64.tar.zst" "%USB_PATH%\" /Y
 
 :: --- 5. Finalize ---
 :: Windows handles 'sync' automatically on copy completion, 

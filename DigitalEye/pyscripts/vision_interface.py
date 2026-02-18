@@ -12,7 +12,6 @@ import re
 from hailo_platform import VDevice
 from hailo_platform.genai import VLM
 from picamera2 import Picamera2
-from vision_engine import Backend
 
 # Configuration
 SOCKET_PATH = "/tmp/digitaleye_vision.sock"

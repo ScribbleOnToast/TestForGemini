@@ -24,12 +24,8 @@ if ! grep -q "dtparam=pciex1_gen=3" /boot/firmware/config.txt; then
     echo "dtparam=pciex1_gen=3" | sudo tee -a /boot/firmware/config.txt
 fi
 
-# 4. .NET 10 Installation
-# Using --install-dir to ensure we know exactly where it lives for the script
-echo "Installing .NET 10..."
-sudo curl -sSL https://dot.net/v1/dotnet-install.sh | sudo bash /dev/stdin --channel 10.0 --install-dir /usr/share/dotnet
-# Create a symlink so 'dotnet' is available globally immediately
-sudo ln -sf /usr/share/dotnet/dotnet /usr/bin/dotnet
+#4. Install ollama
+sudo tar --use-compress-program=unzstd -xvf $SCRIPT_DIR/ollama-linux-amd64.tar.zst -C /usr
 
 # 5. Setup digitaleye Directory Structure
 sudo mkdir -p /opt/digitaleye
@@ -56,6 +52,7 @@ fi
 # Ensuring the camera stack is ready for libcamera/OpenCV
 sudo raspi-config nonint do_camera 0 
 sudo raspi-config nonint do_boot_behaviour B2
+
 # 8. Install the Systemd Service
 echo "--- Configuring Systemd Service ---"
     # 1. Identify the real user (not root)
@@ -83,7 +80,7 @@ echo "--- Configuring Systemd Service ---"
     if [ -d "/run/user/$REAL_UID" ]; then
         echo "   -> Found active session, reloading systemd..."
         sudo -u "$REAL_USER" XDG_RUNTIME_DIR="/run/user/$REAL_UID" systemctl --user daemon-reload
-        #sudo -u "$REAL_USER" XDG_RUNTIME_DIR="/run/user/$REAL_UID" systemctl --user enable digitaleye.service
+        sudo -u "$REAL_USER" XDG_RUNTIME_DIR="/run/user/$REAL_UID" systemctl --user enable digitaleye.service
         echo "   -> Service enabled!"
     else
         echo "   -> No active session found. Creating symlink manually..."
