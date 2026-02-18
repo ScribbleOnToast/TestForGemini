@@ -1,7 +1,6 @@
 namespace DigitalEye;
 
 using DigitalEye.Helpers;
-using DigitalEye;
 using System.Diagnostics;
 using SherpaOnnx;
 using Microsoft.Extensions.Hosting;
@@ -10,7 +9,6 @@ using Microsoft.Extensions.Logging;
 using System.Text;
 using System.Net.Sockets;
 using System.Text.Json;
-using System.Text.Json.Serialization;
 using Pv;
 using System;
 using System.Collections.Generic;
@@ -26,11 +24,19 @@ public class Worker(ILogger<Worker> logger,
 {
 
 #region Worker Properties and Fields
-    //VLM backend process and socket
-    private Process? _pythonProcess;
-    private Socket? _socket;
-    private const string SocketPath = "/tmp/digitaleye_vision.sock";
-    private const string PythonScript = "vision_interface.py";    
+    //VLM backend process and socket (I talk to the camera)
+    private Process? _vlmProcess;
+    private Socket? _vlmScket;
+    private const string VLMSocketPath = "/tmp/digitaleye_vision.sock";
+    private const string VLMPythonScript = "vision_interface.py";
+    private bool _vlmReady = false;
+
+    //LLM backend process and socket (I talk to the language engine - currently in-process, but could be separate)
+    private Process? _llmProcess;
+    private Socket? _llmSocket;
+    private const string LLMSocketPath = "/tmp/digitaleye_brain.sock";
+    private const string LLMPythonScript = "brain_engine.py";
+    private bool _llmReady = false;
 
     //DI stuff
     private readonly ILogger<Worker> _logger = logger;
@@ -63,48 +69,49 @@ public class Worker(ILogger<Worker> logger,
             _appLifetime.StopApplication();
             return;
         }
-        await StartPythonEngine(stoppingToken);
+        
+        _ = Task.Run(async () =>
+        {            
+            while (!_vlmReady && !_llmReady)
+            {
+                await Task.Delay(3000, stoppingToken);
+                _ = _speaker.PlayBeep("confirmation");
+            }            
+        });
+
+        await StartVLMEngine(stoppingToken);
+        await StartLLMEngine(stoppingToken);
         _ = StartListeningForBrainResponsesAsync(stoppingToken);
-        await _routerService.WarmUpAsync();
         await StartListeningLoopAsync(micDevice, stoppingToken);
     }
 
     public override Task StopAsync(CancellationToken cancellationToken)
     {
         _logger.LogInformation("Cleaning up worker resources.");
-        _audioGuard.StopShadowMonitor();
-        _socket?.Close();
-        try
-        {
-            // Attempt to kill the entire process tree where supported
-            _pythonProcess?.Kill(entireProcessTree: true);
-        }
-        catch
-        {
-            try { _pythonProcess?.Kill(); } catch { }
-        }
+        _vlmScket?.Close();
+        _llmSocket?.Close();
+        _vlmProcess?.Kill(entireProcessTree: true);
+        _llmProcess?.Kill(entireProcessTree: true);
         _recognizer?.Dispose();
         _recognizer = null;
+        _audioGuard.StopShadowMonitor();
         return base.StopAsync(cancellationToken);
     }
     #endregion
 
-    #region init routines
-    private async Task StartPythonEngine(CancellationToken ct)
+#region init routines
+    private async Task StartVLMEngine(CancellationToken ct)
     {
         await Announce("Starting Camera System. This may take 20 to 30 seconds.");
-        File.Delete(SocketPath); // Clean up old socket if exists
+        File.Delete(VLMSocketPath); // Clean up old socket if exists
 
-        #region Start Python Process
         // Start the venv python directly (avoids an extra shell and makes shutdown predictable)
-        //var venvPath = Path.Combine(AppContext.BaseDirectory, "venv");
-        var venvPath = Path.Combine("/opt/digitaleye/venv");
+        var venvPath = Path.Combine(AppContext.BaseDirectory, "venv");
         var pythonExe = System.IO.Path.Combine(venvPath, "bin", "python");
-
         var start = new ProcessStartInfo
         {
             FileName = pythonExe,
-            Arguments = $"-u {PythonScript}",
+            Arguments = $"-u {VLMPythonScript}",
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false,
@@ -121,11 +128,11 @@ public class Worker(ILogger<Worker> logger,
         }
         catch { }
 
-        _pythonProcess = new Process { StartInfo = start };
+        _vlmProcess = new Process { StartInfo = start };
 
         // Pipe Python logs to C# Logger
-        _pythonProcess.OutputDataReceived += (s, e) => { if (e.Data != null) _logger.LogInformation($"[BRAIN LOG]: {e.Data}"); };
-        _pythonProcess.ErrorDataReceived += (s, e) =>
+        _vlmProcess.OutputDataReceived += (s, e) => { if (e.Data != null) _logger.LogDebug($"[VLM LOG OD]: {e.Data}"); };
+        _vlmProcess.ErrorDataReceived += (s, e) =>
         {
             if (!string.IsNullOrEmpty(e.Data))
             {
@@ -133,40 +140,40 @@ public class Worker(ILogger<Worker> logger,
                 // If it says "INFO" or "WARN", just log it as info/warning, not an error.
                 if (e.Data.Contains("INFO") || e.Data.Contains("WARN"))
                 {
-                    _logger.LogInformation($"[BRAIN LOG]: {e.Data}");
+                    _logger.LogDebug($"[VLM LOG ER]: {e.Data}");
                 }
                 else
                 {
                     // Real errors (tracebacks, crashes, critical failures)
-                    _logger.LogError($"[BRAIN ERR]: {e.Data}");
+                    _logger.LogError($"[VLM ERR]: {e.Data}");
                 }
             }
         };
 
-        _pythonProcess.Start();
-        _pythonProcess.BeginOutputReadLine();
-        _pythonProcess.BeginErrorReadLine();
+        _vlmProcess.Start();
+        _vlmProcess.BeginOutputReadLine();
+        _vlmProcess.BeginErrorReadLine();
 
-        _logger.LogDebug($"DigitalEye Brain started (PID: {_pythonProcess.Id})");
+        _logger.LogDebug($"DigitalEye Brain started (PID: {_vlmProcess.Id})");
         #endregion
 
         #region Wait for VLM ready
-        while (!File.Exists(SocketPath) && !ct.IsCancellationRequested)
+        while (!File.Exists(VLMSocketPath) && !ct.IsCancellationRequested)
         {
             _logger.LogDebug("Brain Socket not found yet, waiting...");
             await Task.Delay(1000, ct);
         }
 
-        _logger.LogDebug("Connecting to unix socket socket...{SocketPath}", SocketPath);
-        _socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
-        var endpoint = new UnixDomainSocketEndPoint(SocketPath);
+        _logger.LogDebug("Connecting to unix socket socket...{SocketPath}", VLMSocketPath);
+        _vlmScket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+        var endpoint = new UnixDomainSocketEndPoint(VLMSocketPath);
 
         int attempts = 0;
         while (!ct.IsCancellationRequested)
         {
             try
             {
-                await _socket.ConnectAsync(endpoint, ct);
+                await _vlmScket.ConnectAsync(endpoint, ct);
                 _logger.LogDebug("Connected to unix socket!");
                 break;
             }
@@ -178,23 +185,13 @@ public class Worker(ILogger<Worker> logger,
             }
         }
 
-        var vlmready = false;
-        _ = Task.Run(async () =>
-        {
-            while (!vlmready)
-            {
-                _ = _speaker.PlayBeep("confirmation");
-                await Task.Delay(3000, ct);
-            }
-        });
-
-        while (!ct.IsCancellationRequested && !vlmready)
+        while (!ct.IsCancellationRequested && !_vlmReady)
         {
             _logger.LogDebug("Waiting for Brain to signal ready...");
-            if (_socket != null && _socket.Connected)
+            if (_vlmScket != null && _vlmScket.Connected)
             {
                 var buffer = new byte[4096];
-                var bytesRead = await _socket.ReceiveAsync(buffer, SocketFlags.None);
+                var bytesRead = await _vlmScket.ReceiveAsync(buffer, SocketFlags.None);
                 var jsonRes = Encoding.UTF8.GetString(buffer, 0, bytesRead);
 
                 // C. Parse
@@ -202,7 +199,7 @@ public class Worker(ILogger<Worker> logger,
                 if (doc!.Type == "ready")
                 {
                     _logger.LogDebug("python interface and backend are ready!");
-                    vlmready = true;
+                    _vlmReady = true;
                 }
             }
             await Task.Delay(3000, ct);
@@ -210,27 +207,119 @@ public class Worker(ILogger<Worker> logger,
         #endregion
     }
 
-    public async Task StopPythonEngineAsync()
+    private async Task StartLLMEngine(CancellationToken ct)
+    {
+        await Announce("Starting Language Engine...", false);
+        File.Delete(LLMSocketPath); // Clean up old socket if exists
+
+        var pythonExe = "python";
+        var start = new ProcessStartInfo
+        {
+            FileName = pythonExe,
+            Arguments = $"-u {LLMPythonScript}",
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WorkingDirectory = "./pyscripts"
+        };
+
+        _llmProcess = new Process { StartInfo = start };
+
+        // Pipe Python logs to C# Logger
+        _llmProcess.OutputDataReceived += (s, e) => { if (e.Data != null) _logger.LogDebug($"[LLM LOG OD]: {e.Data}"); };
+        _llmProcess.ErrorDataReceived += (s, e) =>
+        {
+            if (!string.IsNullOrEmpty(e.Data))
+            {
+                // Libcamera and HailoRT are noisy on stderr. 
+                // If it says "INFO" or "WARN", just log it as info/warning, not an error.
+                if (e.Data.Contains("INFO") || e.Data.Contains("WARN"))
+                {
+                    _logger.LogDebug($"[LLM LOG ER]: {e.Data}");
+                }
+                else
+                {
+                    // Real errors (tracebacks, crashes, critical failures)
+                    _logger.LogError($"[LLM ERR]: {e.Data}");
+                }
+            }
+        };
+
+        _llmProcess.Start();
+        _llmProcess.BeginOutputReadLine();
+        _llmProcess.BeginErrorReadLine();
+        _logger.LogDebug($"LLM Interface started (PID: {_vlmProcess.Id})");
+
+        while (!File.Exists(LLMSocketPath) && !ct.IsCancellationRequested)
+        {
+            _logger.LogDebug("LLM Socket not found yet, waiting...");
+            await Task.Delay(1000, ct);
+        }
+
+        _logger.LogDebug("Connecting to unix socket socket...{SocketPath}", LLMSocketPath);
+        _vlmScket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+        var endpoint = new UnixDomainSocketEndPoint(LLMSocketPath);
+
+        int attempts = 0;
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                await _vlmScket.ConnectAsync(endpoint, ct);
+                _logger.LogDebug("Connected to unix socket!");
+                break;
+            }
+            catch
+            {
+                attempts++;
+                if (attempts % 5 == 0) _logger.LogWarning("Connecting...");
+                await Task.Delay(1000, ct);
+            }
+        }
+
+        while (!ct.IsCancellationRequested && !_vlmReady)
+        {
+            _logger.LogDebug("Waiting for LLM to signal ready...");
+            if (_vlmScket != null && _vlmScket.Connected)
+            {
+                var buffer = new byte[4096];
+                var bytesRead = await _vlmScket.ReceiveAsync(buffer, SocketFlags.None);
+                var jsonRes = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+
+                // C. Parse
+                var doc = JsonSerializer.Deserialize<VisionResponse>(jsonRes);
+                if (doc!.Type == "ready")
+                {
+                    _logger.LogDebug("LLM interface is ready!");
+                    _vlmReady = true;
+                }
+            }
+            await Task.Delay(3000, ct);
+        }
+        await _routerService.WarmUpAsync();
+        _llmReady = true;
+    }
+    
+    public async Task StopVLMEngine(CancellationToken ct)
     {
         try
         {
-            _ = Announce("Stopping Digital Eye Engine.");
-            if (_pythonProcess != null && !_pythonProcess.HasExited)
+            _ = Announce("Stopping Camera System.");
+            if (_vlmProcess != null && !_vlmProcess.HasExited)
             {
-                _logger.LogInformation("Stopping Digital Eye Engine...");
                 try
                 {
-                    // Attempt graceful shutdown first
-                    _pythonProcess.Close();
-                    if (!_pythonProcess.WaitForExit(5000))
+                    _vlmProcess.Close();
+                    if (!_vlmProcess.WaitForExit(5000))
                     {
                         _logger.LogWarning("Python Brain did not exit gracefully. Attempting to kill...");
-                        _pythonProcess.Kill(entireProcessTree: true);
+                        _vlmProcess.Kill(entireProcessTree: true);
                     }
                 }
                 catch (Exception ex)            {
                     _logger.LogError(ex, "Error while stopping Python Brain: {Message}", ex.Message);
-                    try { _pythonProcess.Kill(); } catch { }
+                    try { _vlmProcess.Kill(); } catch { }
                 }
             }
             await Announce("Digital Eye Engine stopped.");
@@ -241,13 +330,16 @@ public class Worker(ILogger<Worker> logger,
         }
         finally
         {
-            _pythonProcess = null;
-            _socket?.Close();
-            _socket = null;
+            _vlmProcess = null;
+            _llmSocket?.Close();
+            _llmSocket = null;
         }
     }
 
-#endregion
+    public async Task StopLLMEngine(CancellationToken ct)
+    {
+
+    }
 
 #region Core Logic (The Brain)
     private async Task HandleVoiceCommandAsync(RouteCommandResult cmd, CancellationToken cancellationToken)
@@ -263,50 +355,47 @@ public class Worker(ILogger<Worker> logger,
                     switch (sysPayload.Action)
                     {
                         case SystemCommand.Volume_Up:
-                            // Increase volume logic
+                            _speaker.ChangeVolume("up", sysPayload.Value ?? 10);
                             break;
                         case SystemCommand.Volume_Down:
-                            // Decrease volume logic
+                            _speaker.ChangeVolume("down", sysPayload.Value ?? 10);
                             break;
                         case SystemCommand.Volume_Set:
-                            // Set volume to sysPayload.Value
+                            _speaker.ChangeVolume(string.Empty, sysPayload.Value ?? 10);
                             break;
                         case SystemCommand.Mute:
-                            // Mute audio
+                            _speaker.Mute(true);
                             break;
                         case SystemCommand.Unmute:
-                            // Unmute audio
+                            _speaker.Mute(false);
                             break;
                         case SystemCommand.Shutdown:
-                            await StopPythonEngineAsync();
-                            _appLifetime.StopApplication();
+                            await StopVLMEngine(cancellationToken);
+                            Environment.Exit(0);
                             break;
                     }
                 }
                 break;
             case CommandIntent.Override:
                 var overridePayload = cmd.Payload as OverridePayload;
-                if (overridePayload != null)                
+                _ = Announce($"Executing override command: {overridePayload.Action}");
+                // Here you would add logic to handle each override command, e.g.:
+                switch (overridePayload.Action)          
                 {
-                    _ = Announce($"Executing override command: {overridePayload.Action}");
-                    // Here you would add logic to handle each override command, e.g.:
-                    switch (overridePayload.Action)          
-                    {
-                        case OverrideCommand.Stop:
-                            // Stop audio logic
-                            break;
-                        case OverrideCommand.Pause:
-                            // Pause audio logic
-                            break;
-                        case OverrideCommand.Skip:  
-                            // Skip audio logic
-                            break;
-                        case OverrideCommand.Play:
-                            // Play audio logic
-                            break;
-                    }
+                    case OverrideCommand.Stop:
+                    case OverrideCommand.Skip:
+                        await _speaker.StopSpeaking(overridePayload.Action == OverrideCommand.Stop);
+                        break;
+                    case OverrideCommand.Pause:
+                    case OverrideCommand.Play:
+                        // Pause audio logic
+                        await _speaker.PauseSpeaking(overridePayload.Action == OverrideCommand.Pause);
+                        break;
+                    default:
+                        _logger.LogWarning($"Unknown override command received: {overridePayload.Action}");
+                        break;
                 }
-                break;
+                break;       
         }
     }
 
@@ -315,7 +404,7 @@ public class Worker(ILogger<Worker> logger,
         try
         {
             _logger.LogDebug("Getting VLM response: {Prompt}", prompt);
-            if (_socket == null || !_socket.Connected)
+            if (_vlmScket == null || !_vlmScket.Connected)
             {
                 _logger.LogError("Error: VLM Offline");
                 await Announce("Error: VLM Offline");
@@ -323,7 +412,7 @@ public class Worker(ILogger<Worker> logger,
             }
             var jsonReq = JsonSerializer.Serialize(prompt) + "\n"; // newline-delimited
             var reqBytes = Encoding.UTF8.GetBytes(jsonReq);
-            int bytesSent = await _socket.SendAsync(new ArraySegment<byte>(reqBytes), SocketFlags.None);
+            int bytesSent = await _vlmScket.SendAsync(new ArraySegment<byte>(reqBytes), SocketFlags.None);
         }
         catch (Exception ex)
         {
@@ -495,7 +584,7 @@ public class Worker(ILogger<Worker> logger,
     {
         try
         {
-            if (_socket == null) return;
+            if (_vlmScket == null) return;
             var messageBuffer = new StringBuilder();
             var buffer = new byte[4096];
 
@@ -504,7 +593,7 @@ public class Worker(ILogger<Worker> logger,
                 int bytesRead;
                 try
                 {
-                    bytesRead = await _socket.ReceiveAsync(new ArraySegment<byte>(buffer), SocketFlags.None);
+                    bytesRead = await _vlmScket.ReceiveAsync(new ArraySegment<byte>(buffer), SocketFlags.None);
                 }
                 catch
                 {

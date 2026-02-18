@@ -83,7 +83,7 @@ echo "--- Configuring Systemd Service ---"
     if [ -d "/run/user/$REAL_UID" ]; then
         echo "   -> Found active session, reloading systemd..."
         sudo -u "$REAL_USER" XDG_RUNTIME_DIR="/run/user/$REAL_UID" systemctl --user daemon-reload
-        sudo -u "$REAL_USER" XDG_RUNTIME_DIR="/run/user/$REAL_UID" systemctl --user enable digitaleye.service
+        #sudo -u "$REAL_USER" XDG_RUNTIME_DIR="/run/user/$REAL_UID" systemctl --user enable digitaleye.service
         echo "   -> Service enabled!"
     else
         echo "   -> No active session found. Creating symlink manually..."

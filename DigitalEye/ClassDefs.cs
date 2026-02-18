@@ -22,7 +22,7 @@ namespace DigitalEye
         }
     }
 
-    public class RouterResponse
+    public class LLMResponse
     {
         [JsonPropertyName("intent")]
         public string Intent { get; set; } = "ERROR";
@@ -44,6 +44,7 @@ namespace DigitalEye
     public record OverridePayload(OverrideCommand Action) : CommandPayload;
     public record IdentifyPayload(string RawInput) : CommandPayload; // Just the raw text
     public record ErrorPayload(string Message) : CommandPayload;
+
     public enum SystemCommand
     {
         // System commands

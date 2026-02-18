@@ -34,8 +34,7 @@ builder.Services.AddSingleton(sp =>
     var modelPath = Path.Combine("model/llm/", sp.GetRequiredService<IConfiguration>().GetValue<string>("DigitalEye:LLM:ModelPath") ?? "ggml-alpaca-7b-q4.bin");
     var logger = sp.GetRequiredService<ILogger<RouterService>>();
     var speaker = sp.GetRequiredService<Speaker>();
-    var config = sp.GetRequiredService<IConfiguration>();
-    return new RouterService(modelPath, logger, speaker, config);
+    return new RouterService(modelPath, logger, speaker);
 });
 
 builder.Services.AddSingleton<IBluetoothAudioGuard, BluetoothAudioGuard>();

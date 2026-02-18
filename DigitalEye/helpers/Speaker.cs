@@ -1,38 +1,74 @@
 namespace DigitalEye.Helpers;
 
 using SherpaOnnx;
+using NetCoreAudio;
 using System.Diagnostics;
 using System.IO;
 
 public class Speaker : IDisposable
 {
+    public int _currentVolume = 25;
     private readonly OfflineTts _tts;
     private readonly int _sampleRate = 22050; // Piper models are usually 22k
     private readonly int _voiceId;
     private readonly ILogger<Speaker> _logger;
     private LinkedList<string> _messageQueue = new();
-    private Process? _currentPlaybackProcess;
-    private readonly object _playbackLock = new object();
-    private bool isPlaying = false;
+    private Player player;
     public Speaker(string modelDir, int voiceId, ILogger<Speaker> logger)
     { 
-        _logger = logger;
-        string modelPath = Path.Combine(modelDir, "en_US-amy-low.onnx");
-        string tokensPath = Path.Combine(modelDir, "tokens.txt");
-        string dataDir = Path.Combine(modelDir, "espeak-ng-data");        
+        _logger = logger;      
         var config = new OfflineTtsConfig();
-        config.Model.Vits.Model = modelPath;
-        config.Model.Vits.Tokens = tokensPath;
-        config.Model.Vits.DataDir = dataDir;    
+        config.Model.Vits.Model = Path.Combine(modelDir, "en_US-amy-low.onnx");;
+        config.Model.Vits.Tokens = Path.Combine(modelDir, "tokens.txt");;
+        config.Model.Vits.DataDir = Path.Combine(modelDir, "espeak-ng-data");    
         config.Model.NumThreads = 1;
         config.Model.Debug = 0;
         config.Model.Provider = "cpu";
         _tts = new OfflineTts(config);
         _voiceId = voiceId;
         _sampleRate = _tts.SampleRate;
+
+        player = new Player();
+
         Task.Run(() => ProcessQueueAsync(CancellationToken.None));
     }
 
+    #region Playback Controls (Stop/Pause/Skip)
+    public async Task PauseSpeaking(bool pause)
+    {        
+        if(pause)
+        {
+            _logger.LogInformation("Pausing audio...");
+            await player.Pause();
+        }
+        else
+        {
+            _logger.LogInformation("Resuming audio...");
+            await player.Resume();
+        }
+    }
+
+    public async Task StopSpeaking(bool stopQueue = true)
+    {
+        try
+        {
+            _logger.LogInformation("Stopping audio...");
+            if(player.Playing)
+                await player.Stop();
+            if (stopQueue)
+            {
+                _logger.LogInformation("Clearing message queue...");
+                _messageQueue.Clear();
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError($"Error stopping audio: {ex.Message}");
+        }
+    }
+    #endregion
+
+    #region Queue Management
     public async Task SayAsync(string text, bool playNow = false, bool sayNext = false)
     {
         if (playNow)
@@ -48,36 +84,26 @@ public class Speaker : IDisposable
             _messageQueue.AddLast(text);
         }
     }
-
-    public async Task StopSpeaking(bool stopQueue = true)
+    public async Task ProcessQueueAsync(CancellationToken ct)
     {
-        try
+        while (!ct.IsCancellationRequested)
         {
-        lock (_playbackLock)
-        {
-            if (_currentPlaybackProcess != null)
+            if (!player.Playing  && _messageQueue.Count > 0)
             {
-                try
-                {
-                    _messageQueue.Clear();
-                    _currentPlaybackProcess.Kill();
-                    _currentPlaybackProcess.Dispose();
-                    _currentPlaybackProcess = null;
-                    isPlaying = false;
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning($"Failed to kill existing audio: {ex.Message}");
-                }
+                string message = _messageQueue.FirstOrDefault() ?? string.Empty;
+                _messageQueue.RemoveFirst();
+                _ = SayInternalAsync(message, false);
             }
-        }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError($"Error stopping audio: {ex.Message}");
+            else
+            {
+                await Task.Delay(100); // Avoid busy waiting
+            }
         }
     }
 
+    #endregion
+
+    #region Beep Sounds
     public async Task PlayBeep(string type)
     {
         string beepFile = string.Empty;
@@ -99,90 +125,31 @@ public class Speaker : IDisposable
         };
     
         using var speakerProcess = Process.Start(info);       
-    }
+    }    
+    #endregion
 
-    public async Task ProcessQueueAsync(CancellationToken ct)
-    {
-        while (!ct.IsCancellationRequested)
-        {
-            if (!isPlaying && _messageQueue.Count > 0)
-            {
-                string message = _messageQueue.FirstOrDefault() ?? string.Empty;
-                _messageQueue.RemoveFirst();
-                _ = SayInternalAsync(message, false);
-            }
-            else
-            {
-                await Task.Delay(100); // Avoid busy waiting
-            }
-        }
-    }
-
+    #region Internal TTS Logic
     private async Task SayInternalAsync(string text, bool isImmediate = false)
     {
-        isPlaying = true;
         if (string.IsNullOrWhiteSpace(text)) return;
-        if(isImmediate)
-        {
-            _logger.LogInformation($"[Speaking Override]");
-            await StopSpeaking();
-        }
 
-        // 1. Generate Audio (Returns float array)
         var audio = _tts.Generate(text: text, speed: 1.0f, speakerId: _voiceId);
         
         // 2. Save to temporary WAV file
         string tempFile = Path.GetTempFileName() + ".wav";
-        SaveWav(tempFile, audio.Samples, _sampleRate);
-
-        // 3. Play via PulseAudio (paplay)
-        // We use 'paplay' because it handles mixing with your mic input process gracefully
-        var info = new ProcessStartInfo
+        SaveWav(tempFile, audio.Samples, _sampleRate);    
+        player.PlaybackFinished += (s, e) => 
         {
-            FileName = "paplay",
-            Arguments = $"--property=media.role=announce {tempFile}",
-            UseShellExecute = false,
-            CreateNoWindow = true
-        };
-    
-        try 
-        {
-        var speakerProcess = new Process
+            try
             {
-                StartInfo = new ProcessStartInfo
-                {
-                    FileName = "aplay",
-                    Arguments = $"-q \"{tempFile}\"",
-                    RedirectStandardOutput = false,
-                    UseShellExecute = false,
-                    CreateNoWindow = true
-                },
-                // CRITICAL FIX 1: This is required for .Exited to fire!
-                EnableRaisingEvents = true 
-            };
-
-            // CRITICAL FIX 2: Subscribe BEFORE starting
-            speakerProcess.Exited += (sender, args) =>
-            {
-                _logger.LogInformation("[Assistant: Speaking Finished]");
-                isPlaying = false;
-                // Cleanup logic...
-                try { File.Delete(tempFile); } catch { }
-                speakerProcess.Dispose();
-            };
-
-            lock (_playbackLock)
-            {
-                _currentPlaybackProcess = speakerProcess;
+                File.Delete(tempFile);
             }
-
-            // Now it is safe to start
-            speakerProcess.Start();
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError($"Playback error: {ex.Message}");
-        }
+            catch (Exception ex)
+            {
+                _logger.LogError($"Error deleting temp file: {ex.Message}");
+            }
+        };
+        _ = player.Play(tempFile);
     }
 
     private void SaveWav(string filename, float[] samples, int sampleRate)
@@ -216,7 +183,41 @@ public class Speaker : IDisposable
             writer.Write(s);
         }
     }
+    #endregion
+    
+    #region Volume Control (Optional)
+    public int ChangeVolume(string direction,int value = 10)
+    {
+        try
+        {            
+            int newVol = string.IsNullOrEmpty(direction) ? value :_currentVolume + (direction.ToLower() == "up" ? value : -value);
+            newVol = Math.Clamp(newVol, 0, 100);
+            _currentVolume = newVol;
+            player.SetVolume((byte)_currentVolume);
+            return _currentVolume;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError($"Error increasing volume: {ex.Message}");
+            return _currentVolume;
+        }
+    }
 
+    public bool Mute(bool mute)
+    {
+        try
+        {
+            player.SetVolume(mute ? (byte)0 : (byte)_currentVolume);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError($"Error toggling mute: {ex.Message}");
+            return false;
+        }
+    }
+
+    #endregion
     public void Dispose()
     {
         _tts?.Dispose();
